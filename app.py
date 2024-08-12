@@ -1,88 +1,114 @@
-from flask import Flask, request, url_for, jsonify
 import os
-from twilio.rest import Client
-from twilio.twiml.voice_response import VoiceResponse, Gather
-from dotenv import load_dotenv
-import logging
+import re
+import telnyx
+from flask import Flask, request, Response
 
+# this implementation uses Telnyx Call Control API to handle inbound calls and their messaging API to send SMS messages
 
-logging.basicConfig(level=logging.INFO)
-load_dotenv()
 app = Flask(__name__)
-TWILIO_ACCOUNT_SID = os.getenv("ACCOUNT_SID")
-TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
-client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) # Twilio Client
-error_count=0
-callback_number=None
 
-@app.route("/answer", methods=["POST"])  # Answers the incoming call.
-def answer_call():
-    global error_count
-    response= VoiceResponse()
-    if error_count >2:
-        response.say("Sorry, we could not understand your response. You are being transferred", voice="en-US-Neural2-J")
-        response.redirect("/transfer")
-        return str(response)
-    logging.info("Incoming call received")
-    response.say("please use the keypad to enter your callback number.", voice="en-US-Neural2-J")
-    gather = Gather(input='dtmf', action='/confirm', method='POST', numDigits="10")
-    response.append(gather)
-    return str(response)
-
-@app.route("/confirm", methods=["POST"]) # Confirms the callback number.
-def confirm_callback_number():
-    global error_count, callback_number
-    entered_number = request.form.get('Digits')
-    callback_number = extract_number(entered_number)
-
-    response = VoiceResponse()
-    if callback_number is None:
-        response.say("Sorry, I didn't get that. Please use the keypad to enter your callback number.", voice="en-US-Neural2-J")
-        response.redirect("/answer")
-        error_count += 1
-        return str(response)
-
-    response.say("Thank you. You will receive a text message shortly.", voice="en-US-Neural2-J")
-    response.redirect("/link")
-    return str(response)
+telnyx.api_key = os.getenv("TELNYX_API_KEY")  # Initialize Telnyx client with the API key
+PHONE_NUMBER_REGEX = re.compile(r"^\d{10}$")  # Regular expression to validate a 10-digit phone number
 
 
-@app.route("/link", methods=["POST"]) # Asks the current question.
-def link():
-    global callback_number
-    text_number= f"+1{callback_number}"
-    logging.info(f"Sending SMS to {text_number}")
-    message = client.messages.create(
-        body="Join Earth's mightiest heroes. Like Kevin Bacon.",
-        from_="+15735273553",
-        to=text_number,
-        status_callback=url_for('message_status', _external=True)
+speak_tracker = {} # Dictionary to track the type of message played for each call_control_id
+
+@app.route('/handle_call', methods=['POST'])
+def handle_call():
+    data = request.json
+    event_type = data['data']['event_type']
+    payload = data['data'].get('payload', {})
+    call_control_id = payload.get('call_control_id')
+
+    if not call_control_id:
+        handle_messaging_event(data)
+        return Response(status=200)
+
+    if event_type == 'call.initiated':
+        handle_call_initiated(call_control_id)
+
+    elif event_type == 'call.answered':
+        handle_call_answered(call_control_id)
+
+    elif event_type == 'call.gather.ended':
+        handle_gather_ended(call_control_id, payload)
+
+    elif event_type == 'call.speak.ended':
+        handle_speak_ended(call_control_id)
+
+    return Response(status=200)
+
+def handle_call_initiated(call_control_id):
+    print("Event: Call initiated.")
+    telnyx.Call.retrieve(call_control_id).answer()
+
+def handle_call_answered(call_control_id):
+    print("Event: Call answered.")
+    call = telnyx.Call.retrieve(call_control_id)
+    call.speak(
+        payload='Please enter your 10-digit callback number followed by the pound sign.',
+        language='en-US',
+        voice='female'
     )
-    response = VoiceResponse()
-    response.say("Message sent. Thank you for calling. Goodbye.", voice="en-US-Neural2-J")
-    response.hangup()
-    return str(response)
+    call.gather(
+        minimum_digits=10,
+        maximum_digits=10,
+        timeout_millis=60000,
+        terminating_digit="#",
+        valid_digits="0123456789#"
+    )
 
-@app.route("/message_status", methods=["POST"])  # Handles message status callbacks.
-def message_status():
-    message_sid = request.form.get('MessageSid')
-    message_status = request.form.get('MessageStatus')
-    logging.info(f"Message SID: {message_sid}, Status: {message_status}")
-    return jsonify({'status': 'received'}), 200
+def handle_gather_ended(call_control_id, payload):
+    digits = payload.get('digits')
+    print(f"Event: Gather ended. Digits received: {digits}")
+    call = telnyx.Call.retrieve(call_control_id)
 
-
-@app.route("/transfer", methods=["POST"]) # Transfers the caller to an agent.
-def transfer():
-    response = VoiceResponse()
-    response.say("You are being transferred to an agent.", voice="en-US-Neural2-J")
-    return str(response)
-
-def extract_number(number):
-    if len(number) == 10:
-        return number
+    if digits and PHONE_NUMBER_REGEX.match(digits):
+        print("Event: Validating number.")
+        send_confirmation_message(call, digits, call_control_id)
     else:
-        return None
+        print("Event: Invalid number entered.")
+        play_invalid_number_message(call, call_control_id)
 
+def handle_speak_ended(call_control_id):
+    last_message = speak_tracker.get(call_control_id)
+    call = telnyx.Call.retrieve(call_control_id)
 
-if __name__ == '__main__':
-    app.run()
+    if last_message == 'confirmation':
+        print("Event: Confirmation message ended, hanging up now.")
+        call.hangup()
+        speak_tracker.pop(call_control_id, None)
+    elif last_message == 'invalid_number':
+        print("Event: Invalid number prompt ended, waiting for user input.")
+
+def send_confirmation_message(call, digits, call_control_id):
+    telnyx.Message.create(
+        from_=os.getenv('TELNYX_NUMBER'),
+        to=f"+1{digits}",
+        text=f"We received your callback number: {digits}. We will contact you shortly."
+    )
+    call.speak(
+        payload='Thank you! We have received your callback number and will reach out soon.',
+        language='en-US',
+        voice='female'
+    )
+    speak_tracker[call_control_id] = 'confirmation'
+
+def play_invalid_number_message(call, call_control_id):
+    call.speak(
+        payload='The number you entered is invalid. Please try again.',
+        language='en-US',
+        voice='female'
+    )
+    speak_tracker[call_control_id] = 'invalid_number'
+
+def handle_messaging_event(data):
+    event_type = data['data']['event_type']
+    print("Handling messaging event.")
+    if event_type == 'message.sent':
+        print("Event: Message sent successfully.")
+    elif event_type == 'message.finalized':
+        print("Event: Message finalized.")
+
+if __name__ == "__main__":
+    app.run(port=5000, debug=True)
